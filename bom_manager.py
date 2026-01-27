@@ -595,6 +595,9 @@ class BOMManagerGUI:
         ttk.Button(top_frame, text="Calculate Cost", 
                   command=self.calculate_cost).grid(row=0, column=4, padx=5)
         
+        ttk.Button(top_frame, text="Refresh Products", 
+                  command=self.refresh_cost_products).grid(row=0, column=5, padx=5)
+        
         # Results frame
         results_frame = ttk.LabelFrame(self.cost_tab, text="Cost Breakdown", padding=10)
         results_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
