@@ -982,13 +982,132 @@ class BOMManagerGUI:
             messagebox.showerror("Error", "No products exist. Create a product first.")
             return
         
-        # Simple dialog to select product (you could enhance this)
-        messagebox.showinfo("Import", 
-                          "CSV should have columns: mfg_part_number, manufacturer, description, "
-                          "category, quantity, distributor, unit_cost, reference_designators")
+        # Create product selection dialog
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Select Product for Import")
+        dialog.geometry("400x150")
+        dialog.transient(self.root)
+        dialog.grab_set()
         
-        messagebox.showinfo("Note", "Import feature requires product selection - "
-                          "this is a basic implementation. Enhance as needed.")
+        ttk.Label(dialog, text="Select product to import BOM into:", 
+                 font=('TkDefaultFont', 10)).pack(pady=10)
+        
+        product_var = tk.StringVar()
+        product_combo = ttk.Combobox(dialog, textvariable=product_var,
+                                     width=50, state='readonly')
+        product_list = [f"{p['part_number']} - {p['description']}" for p in products]
+        product_combo['values'] = product_list
+        product_combo.pack(pady=10)
+        
+        selected_product = {'value': None}
+        
+        def on_ok():
+            if not product_var.get():
+                messagebox.showerror("Error", "Please select a product")
+                return
+            selected_product['value'] = product_var.get()
+            dialog.destroy()
+        
+        def on_cancel():
+            dialog.destroy()
+        
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="OK", command=on_ok).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side=tk.LEFT, padx=5)
+        
+        dialog.wait_window()
+        
+        if not selected_product['value']:
+            return
+        
+        part_number = selected_product['value'].split(' - ')[0]
+        product = self.db.get_product(part_number)
+        
+        if not product:
+            return
+        
+        # Read and import CSV
+        try:
+            imported_count = 0
+            skipped_count = 0
+            
+            with open(filename, 'r', newline='', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+                
+                # Check for required columns
+                required_cols = ['mfg_part_number', 'manufacturer', 'quantity']
+                if not all(col in reader.fieldnames for col in required_cols):
+                    messagebox.showerror("Error", 
+                        f"CSV must contain columns: {', '.join(required_cols)}\n"
+                        f"Found: {', '.join(reader.fieldnames)}")
+                    return
+                
+                for row in reader:
+                    try:
+                        # Skip empty rows
+                        if not row.get('mfg_part_number') or not row.get('manufacturer'):
+                            continue
+                        
+                        # Add or get component
+                        component_id = self.db.add_component(
+                            row['mfg_part_number'].strip(),
+                            row['manufacturer'].strip(),
+                            row.get('description', '').strip(),
+                            row.get('category', '').strip(),
+                            row.get('unit_of_measure', 'EA').strip()
+                        )
+                        
+                        if not component_id:
+                            skipped_count += 1
+                            continue
+                        
+                        # Add distributor source if provided
+                        if row.get('distributor') and row.get('unit_cost'):
+                            try:
+                                unit_cost = float(row['unit_cost'])
+                                self.db.add_component_source(
+                                    component_id,
+                                    row['distributor'].strip(),
+                                    row.get('distributor_part_number', '').strip(),
+                                    unit_cost,
+                                    int(row.get('minimum_order_qty', 1)),
+                                    int(row['lead_time_days']) if row.get('lead_time_days') else None
+                                )
+                            except (ValueError, KeyError):
+                                pass  # Skip invalid cost data
+                        
+                        # Add to BOM
+                        quantity = float(row['quantity'])
+                        ref_des = row.get('reference_designators', '').strip()
+                        notes = row.get('notes', '').strip()
+                        
+                        self.db.add_bom_entry(
+                            product['product_id'],
+                            component_id,
+                            quantity,
+                            ref_des,
+                            notes=notes
+                        )
+                        
+                        imported_count += 1
+                        
+                    except Exception as e:
+                        print(f"Error importing row: {row}, Error: {e}")
+                        skipped_count += 1
+                        continue
+            
+            messagebox.showinfo("Import Complete", 
+                f"Successfully imported {imported_count} components.\n"
+                f"Skipped {skipped_count} items.")
+            
+            # Refresh displays
+            self.refresh_components()
+            if self.bom_product_var.get() and part_number in self.bom_product_var.get():
+                self.load_bom()
+                
+        except Exception as e:
+            messagebox.showerror("Import Error", f"Error reading CSV file:\n{str(e)}")
     
     def export_bom_csv(self):
         """Export BOM to CSV file"""
@@ -1016,32 +1135,30 @@ class BOMManagerGUI:
         
         with open(filename, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['Type', 'Part Number', 'Manufacturer/Product', 'Description',
-                           'Quantity', 'Ref Des', 'Distributor', 'Unit Cost'])
+            # Header matches import format
+            writer.writerow(['mfg_part_number', 'manufacturer', 'description', 'category',
+                           'quantity', 'reference_designators', 'distributor', 
+                           'distributor_part_number', 'unit_cost', 'minimum_order_qty', 
+                           'lead_time_days', 'notes'])
             
             for comp in components:
                 writer.writerow([
-                    'Component',
                     comp['mfg_part_number'],
                     comp['manufacturer'],
                     comp['description'],
+                    comp['category'],
                     comp['quantity'],
                     comp['reference_designators'],
                     comp['distributor'] or '',
-                    comp['unit_cost'] or ''
+                    comp['distributor_part_number'] or '',
+                    comp['unit_cost'] or '',
+                    comp['minimum_order_qty'] or '',
+                    comp['lead_time_days'] or '',
+                    comp['notes'] or ''
                 ])
-            
-            for sub in sub_assemblies:
-                writer.writerow([
-                    'Sub-Assembly',
-                    sub['part_number'],
-                    'Assembly',
-                    sub['description'],
-                    sub['quantity'],
-                    sub['reference_designators'],
-                    '',
-                    ''
-                ])
+        
+        # Note: Sub-assemblies are not included in standard CSV export
+        # They can be viewed in the GUI or use flattened BOM export
         
         messagebox.showinfo("Success", f"BOM exported to {filename}")
 
