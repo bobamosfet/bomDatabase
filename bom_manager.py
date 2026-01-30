@@ -152,15 +152,40 @@ class BOMDatabase:
     def add_component_source(self, component_id, distributor, distributor_part_number,
                             unit_cost, minimum_order_qty=1, lead_time_days=None):
         """Add a source for a component"""
-        now = datetime.now().isoformat()
+        # Check if this source already exists
         self.cursor.execute("""
-            INSERT INTO component_sources (component_id, distributor, distributor_part_number,
-                                          unit_cost, minimum_order_qty, lead_time_days, last_updated)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (component_id, distributor, distributor_part_number, unit_cost, 
-              minimum_order_qty, lead_time_days, now))
-        self.conn.commit()
-        return self.cursor.lastrowid
+            SELECT source_id FROM component_sources 
+            WHERE component_id = ? AND distributor = ?
+        """, (component_id, distributor))
+        
+        existing = self.cursor.fetchone()
+        
+        if existing:
+            # Update existing source instead of creating duplicate
+            now = datetime.now().isoformat()
+            self.cursor.execute("""
+                UPDATE component_sources 
+                SET distributor_part_number = ?,
+                    unit_cost = ?,
+                    minimum_order_qty = ?,
+                    lead_time_days = ?,
+                    last_updated = ?
+                WHERE source_id = ?
+            """, (distributor_part_number, unit_cost, minimum_order_qty, 
+                  lead_time_days, now, existing['source_id']))
+            self.conn.commit()
+            return existing['source_id']
+        else:
+            # Create new source
+            now = datetime.now().isoformat()
+            self.cursor.execute("""
+                INSERT INTO component_sources (component_id, distributor, distributor_part_number,
+                                              unit_cost, minimum_order_qty, lead_time_days, last_updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (component_id, distributor, distributor_part_number, unit_cost, 
+                  minimum_order_qty, lead_time_days, now))
+            self.conn.commit()
+            return self.cursor.lastrowid
     
     def add_bom_entry(self, product_id, component_id, quantity, reference_designators="", 
                      do_not_populate=False, notes=""):
@@ -203,6 +228,8 @@ class BOMDatabase:
         dnp_filter = "" if include_dnp else "AND be.do_not_populate = 0"
         self.cursor.execute(f"""
             SELECT 
+                c.component_id,
+                be.entry_id,
                 c.mfg_part_number,
                 c.manufacturer,
                 c.description,
@@ -212,15 +239,24 @@ class BOMDatabase:
                 be.reference_designators,
                 be.do_not_populate,
                 be.notes,
-                cs.distributor,
-                cs.distributor_part_number,
-                cs.unit_cost,
-                cs.minimum_order_qty,
-                cs.lead_time_days,
+                (SELECT distributor FROM component_sources 
+                 WHERE component_id = c.component_id 
+                 ORDER BY unit_cost ASC LIMIT 1) as distributor,
+                (SELECT distributor_part_number FROM component_sources 
+                 WHERE component_id = c.component_id 
+                 ORDER BY unit_cost ASC LIMIT 1) as distributor_part_number,
+                (SELECT unit_cost FROM component_sources 
+                 WHERE component_id = c.component_id 
+                 ORDER BY unit_cost ASC LIMIT 1) as unit_cost,
+                (SELECT minimum_order_qty FROM component_sources 
+                 WHERE component_id = c.component_id 
+                 ORDER BY unit_cost ASC LIMIT 1) as minimum_order_qty,
+                (SELECT lead_time_days FROM component_sources 
+                 WHERE component_id = c.component_id 
+                 ORDER BY unit_cost ASC LIMIT 1) as lead_time_days,
                 'component' as item_type
             FROM bom_entries be
             JOIN components c ON be.component_id = c.component_id
-            LEFT JOIN component_sources cs ON c.component_id = cs.component_id
             WHERE be.product_id = ? {dnp_filter}
             ORDER BY be.reference_designators, c.mfg_part_number
         """, (product_id,))
@@ -229,6 +265,7 @@ class BOMDatabase:
         # Get sub-assemblies
         self.cursor.execute("""
             SELECT 
+                sa.sub_assembly_id,
                 p.part_number,
                 p.description,
                 sa.quantity,
@@ -266,14 +303,21 @@ class BOMDatabase:
         
         # Calculate sub-assembly costs recursively
         for sub in sub_assemblies:
-            sub_cost, _ = self.calculate_bom_cost(sub['product_id'], 
+            sub_cost, sub_breakdown = self.calculate_bom_cost(sub['product_id'], 
                                                    float(sub['quantity']) * quantity, 
                                                    include_dnp)
             total_cost += sub_cost
+            
+            # Calculate per-unit cost (handle zero quantity gracefully)
+            if float(sub['quantity']) * quantity > 0:
+                unit_cost = sub_cost / (float(sub['quantity']) * quantity)
+            else:
+                unit_cost = 0.0
+            
             component_costs.append({
-                'item': f"[Assembly] {sub['part_number']}",
+                'item': f"[SUB-ASSEMBLY] {sub['part_number']} - {sub['description']}",
                 'quantity': sub['quantity'],
-                'unit_cost': sub_cost / (float(sub['quantity']) * quantity),
+                'unit_cost': unit_cost,
                 'total': sub_cost
             })
         
@@ -312,6 +356,79 @@ class BOMDatabase:
         flatten_recursive(product_id, quantity)
         return list(flattened.values())
     
+    def delete_bom_entry(self, entry_id):
+        """Delete a BOM entry (component from a product)"""
+        self.cursor.execute("DELETE FROM bom_entries WHERE entry_id = ?", (entry_id,))
+        self.conn.commit()
+        return self.cursor.rowcount > 0
+    
+    def delete_sub_assembly_entry(self, sub_assembly_id):
+        """Delete a sub-assembly entry (product from another product)"""
+        self.cursor.execute("DELETE FROM sub_assemblies WHERE sub_assembly_id = ?", (sub_assembly_id,))
+        self.conn.commit()
+        return self.cursor.rowcount > 0
+    
+    def delete_entire_bom(self, product_id):
+        """Delete all BOM entries and sub-assemblies for a product"""
+        # Delete all component entries
+        self.cursor.execute("DELETE FROM bom_entries WHERE product_id = ?", (product_id,))
+        components_deleted = self.cursor.rowcount
+        
+        # Delete all sub-assembly entries
+        self.cursor.execute("DELETE FROM sub_assemblies WHERE parent_product_id = ?", (product_id,))
+        subs_deleted = self.cursor.rowcount
+        
+        self.conn.commit()
+        return components_deleted + subs_deleted
+    
+    def get_bom_entry_id(self, product_id, component_id):
+        """Get the entry_id for a specific component in a product's BOM"""
+        self.cursor.execute("""
+            SELECT entry_id FROM bom_entries 
+            WHERE product_id = ? AND component_id = ?
+        """, (product_id, component_id))
+        result = self.cursor.fetchone()
+        return result['entry_id'] if result else None
+    
+    def get_sub_assembly_entry_id(self, parent_product_id, child_product_id):
+        """Get the sub_assembly_id for a specific sub-assembly relationship"""
+        self.cursor.execute("""
+            SELECT sub_assembly_id FROM sub_assemblies 
+            WHERE parent_product_id = ? AND child_product_id = ?
+        """, (parent_product_id, child_product_id))
+        result = self.cursor.fetchone()
+        return result['sub_assembly_id'] if result else None
+    
+    def cleanup_duplicate_sources(self):
+        """Remove duplicate component sources, keeping the most recent one"""
+        # Find duplicates (same component_id + distributor)
+        self.cursor.execute("""
+            SELECT component_id, distributor, COUNT(*) as count
+            FROM component_sources
+            GROUP BY component_id, distributor
+            HAVING count > 1
+        """)
+        duplicates = self.cursor.fetchall()
+        
+        removed_count = 0
+        for dup in duplicates:
+            # Keep the most recent one, delete the rest
+            self.cursor.execute("""
+                SELECT source_id FROM component_sources
+                WHERE component_id = ? AND distributor = ?
+                ORDER BY last_updated DESC
+            """, (dup['component_id'], dup['distributor']))
+            
+            all_sources = self.cursor.fetchall()
+            # Keep first (most recent), delete others
+            for source in all_sources[1:]:
+                self.cursor.execute("DELETE FROM component_sources WHERE source_id = ?", 
+                                  (source['source_id'],))
+                removed_count += 1
+        
+        self.conn.commit()
+        return removed_count
+    
     def close(self):
         """Close database connection"""
         if self.conn:
@@ -342,6 +459,10 @@ class BOMManagerGUI:
         file_menu.add_command(label="Export BOM to CSV", command=self.export_bom_csv)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.quit)
+        
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+        tools_menu.add_command(label="Clean Up Duplicate Components", command=self.cleanup_duplicates)
         
         # Create notebook for tabs
         self.notebook = ttk.Notebook(self.root)
@@ -573,6 +694,17 @@ class BOMManagerGUI:
         self.bom_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
+        # Button frame for BOM operations
+        bom_btn_frame = ttk.Frame(bottom_frame)
+        bom_btn_frame.pack(fill=tk.X, pady=5)
+        
+        ttk.Button(bom_btn_frame, text="Delete Selected Item", 
+                  command=self.delete_bom_item).pack(side=tk.LEFT, padx=5)
+        ttk.Button(bom_btn_frame, text="Clear Entire BOM", 
+                  command=self.clear_entire_bom).pack(side=tk.LEFT, padx=5)
+        ttk.Label(bom_btn_frame, text="(Select an item in the list above to delete it)", 
+                 foreground='gray').pack(side=tk.LEFT, padx=20)
+        
         self.refresh_bom_products()
     
     def setup_cost_tab(self):
@@ -682,23 +814,45 @@ class BOMManagerGUI:
             messagebox.showerror("Error", "Invalid cost value")
             return
         
+        # Check if component already exists
+        self.db.cursor.execute("""
+            SELECT component_id FROM components 
+            WHERE mfg_part_number = ? AND manufacturer = ?
+        """, (mpn, mfg))
+        existing_component = self.db.cursor.fetchone()
+        
         component_id = self.db.add_component(mpn, mfg, desc, cat)
         
-        if component_id and dist and cost is not None:
-            self.db.add_component_source(component_id, dist, dpn, cost)
-        
-        if component_id:
-            messagebox.showinfo("Success", f"Component {mpn} added successfully")
-            self.comp_mpn_entry.delete(0, tk.END)
-            self.comp_mfg_entry.delete(0, tk.END)
-            self.comp_desc_entry.delete(0, tk.END)
-            self.comp_cat_entry.delete(0, tk.END)
-            self.comp_dist_entry.delete(0, tk.END)
-            self.comp_dpn_entry.delete(0, tk.END)
-            self.comp_cost_entry.delete(0, tk.END)
-            self.refresh_components()
+        message = ""
+        if existing_component:
+            message = f"Component {mpn} already exists. "
         else:
-            messagebox.showinfo("Info", "Component may already exist")
+            message = f"Component {mpn} added successfully. "
+        
+        if component_id and dist and cost is not None:
+            # Check if this distributor source already exists
+            self.db.cursor.execute("""
+                SELECT source_id FROM component_sources 
+                WHERE component_id = ? AND distributor = ?
+            """, (component_id, dist))
+            existing_source = self.db.cursor.fetchone()
+            
+            self.db.add_component_source(component_id, dist, dpn, cost)
+            
+            if existing_source:
+                message += f"Updated pricing from {dist}."
+            else:
+                message += f"Added distributor {dist}."
+        
+        messagebox.showinfo("Success", message)
+        self.comp_mpn_entry.delete(0, tk.END)
+        self.comp_mfg_entry.delete(0, tk.END)
+        self.comp_desc_entry.delete(0, tk.END)
+        self.comp_cat_entry.delete(0, tk.END)
+        self.comp_dist_entry.delete(0, tk.END)
+        self.comp_dpn_entry.delete(0, tk.END)
+        self.comp_cost_entry.delete(0, tk.END)
+        self.refresh_components()
     
     def refresh_products(self):
         """Refresh the products list"""
@@ -764,6 +918,12 @@ class BOMManagerGUI:
         if not product:
             return
         
+        # Store current product_id for later use
+        self.current_bom_product_id = product['product_id']
+        
+        # Dictionary to store item metadata (maps tree item_id to database ID)
+        self.bom_item_metadata = {}
+        
         # Clear existing items
         for item in self.bom_tree.get_children():
             self.bom_tree.delete(item)
@@ -771,23 +931,38 @@ class BOMManagerGUI:
         # Load BOM
         components, sub_assemblies = self.db.get_product_bom(product['product_id'])
         
-        # Add components
-        for comp in components:
-            cost_str = f"${comp['unit_cost']:.2f}" if comp['unit_cost'] else ''
-            self.bom_tree.insert('', 'end', values=(
-                'Component',
-                comp['mfg_part_number'],
-                comp['manufacturer'],
-                comp['description'],
-                comp['quantity'],
-                comp['reference_designators'],
-                comp['distributor'] or '',
-                cost_str
-            ))
+        # DEBUG: Print what we got
+        print(f"DEBUG: Loading BOM for product_id {product['product_id']}")
+        print(f"DEBUG: Found {len(components)} components")
+        print(f"DEBUG: Found {len(sub_assemblies)} sub-assemblies")
         
-        # Add sub-assemblies
-        for sub in sub_assemblies:
-            self.bom_tree.insert('', 'end', values=(
+        # Add components - use entry_id from query results
+        for idx, comp in enumerate(components):
+            try:
+                print(f"DEBUG: Component {idx}: {comp['mfg_part_number']} - entry_id: {comp['entry_id']}")
+                
+                cost_str = f"${comp['unit_cost']:.2f}" if comp['unit_cost'] else ''
+                
+                item_id = self.bom_tree.insert('', 'end', values=(
+                    'Component',
+                    comp['mfg_part_number'],
+                    comp['manufacturer'],
+                    comp['description'],
+                    comp['quantity'],
+                    comp['reference_designators'],
+                    comp['distributor'] or '',
+                    cost_str
+                ))
+                # Store metadata in dictionary
+                self.bom_item_metadata[item_id] = ('component', comp['entry_id'])
+            except Exception as e:
+                print(f"ERROR loading component {idx}: {e}")
+                raise
+        
+        # Add sub-assemblies - use sub_assembly_id from query results
+        for idx, sub in enumerate(sub_assemblies):
+            print(f"DEBUG: Sub-assembly {idx}: {sub['part_number']} - sub_assembly_id: {sub['sub_assembly_id']}")
+            item_id = self.bom_tree.insert('', 'end', values=(
                 'Sub-Assembly',
                 sub['part_number'],
                 'Assembly',
@@ -797,6 +972,10 @@ class BOMManagerGUI:
                 '',
                 ''
             ))
+            # Store metadata in dictionary
+            self.bom_item_metadata[item_id] = ('subassembly', sub['sub_assembly_id'])
+        
+        print(f"DEBUG: Total items in tree: {len(self.bom_tree.get_children())}")
     
     def add_to_bom(self):
         """Add component to BOM"""
@@ -827,6 +1006,18 @@ class BOMManagerGUI:
         component = self.db.cursor.fetchone()
         
         if product and component:
+            # Check for duplicate
+            self.db.cursor.execute("""
+                SELECT entry_id FROM bom_entries 
+                WHERE product_id = ? AND component_id = ?
+            """, (product['product_id'], component['component_id']))
+            
+            if self.db.cursor.fetchone():
+                messagebox.showerror("Duplicate Entry", 
+                    f"Component {mpn} ({mfg}) is already in this BOM.\n\n"
+                    "To change quantity or reference designators, delete the existing entry first.")
+                return
+            
             ref_des = self.bom_comp_ref_entry.get().strip()
             self.db.add_bom_entry(product['product_id'], component['component_id'], 
                                  qty, ref_des)
@@ -862,6 +1053,18 @@ class BOMManagerGUI:
         child_product = self.db.get_product(child_pn)
         
         if parent_product and child_product:
+            # Check for duplicate
+            self.db.cursor.execute("""
+                SELECT sub_assembly_id FROM sub_assemblies 
+                WHERE parent_product_id = ? AND child_product_id = ?
+            """, (parent_product['product_id'], child_product['product_id']))
+            
+            if self.db.cursor.fetchone():
+                messagebox.showerror("Duplicate Entry", 
+                    f"Sub-assembly {child_pn} is already in this BOM.\n\n"
+                    "To change quantity or reference designators, delete the existing entry first.")
+                return
+            
             ref_des = self.bom_sub_ref_entry.get().strip()
             self.db.add_sub_assembly(parent_product['product_id'], 
                                     child_product['product_id'], qty, ref_des)
@@ -876,6 +1079,91 @@ class BOMManagerGUI:
         products = self.db.get_all_products()
         product_list = [f"{p['part_number']} - {p['description']}" for p in products]
         self.cost_product_combo['values'] = product_list
+    
+    def delete_bom_item(self):
+        """Delete selected BOM item"""
+        selected = self.bom_tree.selection()
+        if not selected:
+            messagebox.showwarning("No Selection", "Please select an item to delete")
+            return
+        
+        # Get the item's metadata from dictionary
+        item_id = selected[0]
+        
+        if item_id not in self.bom_item_metadata:
+            messagebox.showerror("Error", "Cannot find item metadata")
+            return
+        
+        item_type, db_id = self.bom_item_metadata[item_id]
+        
+        # Get item info for confirmation
+        values = self.bom_tree.item(item_id, 'values')
+        item_name = f"{values[1]} ({values[2]})" if values else "this item"
+        
+        # Confirm deletion
+        if not messagebox.askyesno("Confirm Delete", 
+                                   f"Delete {item_name} from this BOM?"):
+            return
+        
+        # Delete from database
+        success = False
+        if item_type == 'component':
+            success = self.db.delete_bom_entry(db_id)
+        elif item_type == 'subassembly':
+            success = self.db.delete_sub_assembly_entry(db_id)
+        
+        if success:
+            messagebox.showinfo("Success", "Item deleted from BOM")
+            self.load_bom()  # Refresh the display
+        else:
+            messagebox.showerror("Error", "Failed to delete item")
+    
+    def clear_entire_bom(self):
+        """Clear all items from the current BOM"""
+        if not hasattr(self, 'current_bom_product_id'):
+            messagebox.showwarning("No Product", "Please select a product first")
+            return
+        
+        selected = self.bom_product_var.get()
+        if not selected:
+            messagebox.showwarning("No Product", "Please select a product first")
+            return
+        
+        part_number = selected.split(' - ')[0]
+        
+        # Confirm deletion
+        if not messagebox.askyesno("Confirm Clear BOM", 
+                                   f"Are you sure you want to delete ALL components and sub-assemblies from {part_number}?\n\n"
+                                   "This action cannot be undone!",
+                                   icon='warning'):
+            return
+        
+        # Delete from database
+        count = self.db.delete_entire_bom(self.current_bom_product_id)
+        
+        if count > 0:
+            messagebox.showinfo("Success", f"Deleted {count} items from BOM")
+            self.load_bom()  # Refresh the display
+        else:
+            messagebox.showinfo("Info", "BOM is already empty")
+    
+    def cleanup_duplicates(self):
+        """Clean up duplicate component sources"""
+        if not messagebox.askyesno("Clean Up Duplicates", 
+                                   "This will remove duplicate component sources (same component + distributor).\n\n"
+                                   "The most recent entry for each duplicate will be kept.\n\n"
+                                   "Continue?"):
+            return
+        
+        count = self.db.cleanup_duplicate_sources()
+        
+        if count > 0:
+            messagebox.showinfo("Cleanup Complete", 
+                              f"Removed {count} duplicate component source(s).\n\n"
+                              "The Components tab will now be refreshed.")
+            self.refresh_components()
+        else:
+            messagebox.showinfo("No Duplicates", "No duplicate component sources found.")
     
     def calculate_cost(self):
         """Calculate and display cost breakdown"""
@@ -908,12 +1196,26 @@ class BOMManagerGUI:
         
         # Add breakdown
         for item in breakdown:
-            self.cost_tree.insert('', 'end', values=(
-                item['item'],
-                f"{item['quantity']:.2f}",
-                f"${item['unit_cost']:.4f}",
-                f"${item['total']:.2f}"
-            ))
+            # Format differently for sub-assemblies vs components
+            if '[SUB-ASSEMBLY]' in item['item']:
+                # Sub-assemblies in bold (using tags)
+                self.cost_tree.insert('', 'end', values=(
+                    item['item'],
+                    f"{item['quantity']:.2f}",
+                    f"${item['unit_cost']:.4f}" if item['unit_cost'] > 0 else "Calculated",
+                    f"${item['total']:.2f}"
+                ), tags=('subassembly',))
+            else:
+                # Regular components
+                self.cost_tree.insert('', 'end', values=(
+                    item['item'],
+                    f"{item['quantity']:.2f}",
+                    f"${item['unit_cost']:.4f}",
+                    f"${item['total']:.2f}"
+                ))
+        
+        # Configure tags for better visibility
+        self.cost_tree.tag_configure('subassembly', background='#e8f4f8')
     
     def export_flattened_bom(self):
         """Export flattened BOM to CSV"""
@@ -1077,10 +1379,24 @@ class BOMManagerGUI:
                             except (ValueError, KeyError):
                                 pass  # Skip invalid cost data
                         
-                        # Add to BOM
+                        # Add to BOM - check for duplicates first
                         quantity = float(row['quantity'])
                         ref_des = row.get('reference_designators', '').strip()
                         notes = row.get('notes', '').strip()
+                        
+                        # Check if this component already exists in the BOM
+                        self.db.cursor.execute("""
+                            SELECT entry_id FROM bom_entries 
+                            WHERE product_id = ? AND component_id = ?
+                        """, (product['product_id'], component_id))
+                        
+                        existing = self.db.cursor.fetchone()
+                        
+                        if existing:
+                            # Component already in BOM, skip it
+                            skipped_count += 1
+                            print(f"Skipped duplicate: {row['mfg_part_number']} ({row['manufacturer']})")
+                            continue
                         
                         self.db.add_bom_entry(
                             product['product_id'],
@@ -1135,14 +1451,15 @@ class BOMManagerGUI:
         
         with open(filename, 'w', newline='') as f:
             writer = csv.writer(f)
-            # Header matches import format
-            writer.writerow(['mfg_part_number', 'manufacturer', 'description', 'category',
+            # Header matches import format plus item_type to distinguish sub-assemblies
+            writer.writerow(['item_type', 'mfg_part_number', 'manufacturer', 'description', 'category',
                            'quantity', 'reference_designators', 'distributor', 
                            'distributor_part_number', 'unit_cost', 'minimum_order_qty', 
                            'lead_time_days', 'notes'])
             
             for comp in components:
                 writer.writerow([
+                    'component',
                     comp['mfg_part_number'],
                     comp['manufacturer'],
                     comp['description'],
@@ -1156,11 +1473,26 @@ class BOMManagerGUI:
                     comp['lead_time_days'] or '',
                     comp['notes'] or ''
                 ])
+            
+            # Include sub-assemblies in export
+            for sub in sub_assemblies:
+                writer.writerow([
+                    'sub_assembly',
+                    sub['part_number'],
+                    'SUB-ASSEMBLY',
+                    sub['description'],
+                    'Assembly',
+                    sub['quantity'],
+                    sub['reference_designators'],
+                    '',
+                    '',
+                    '',
+                    '',
+                    '',
+                    sub['notes'] or ''
+                ])
         
-        # Note: Sub-assemblies are not included in standard CSV export
-        # They can be viewed in the GUI or use flattened BOM export
-        
-        messagebox.showinfo("Success", f"BOM exported to {filename}")
+        messagebox.showinfo("Success", f"BOM exported to {filename}\n\nNote: Sub-assemblies are marked as 'sub_assembly' in the item_type column.")
 
 
 def main():
